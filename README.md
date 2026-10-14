@@ -27,30 +27,31 @@ The `mcp` command is the normal local stdio mode. Use `http` when an MCP client 
 
 The AI client keeps conversation context. The server also keeps explicitly saved drafts locally, but has no hidden conversation memory. Tool calls pass IDs, targets, and draft content explicitly.
 
-Use `save_draft` while writing, then review `get_draft`; a draft can later provide the title, content, and target to `submit_documentation`, which still requires a separate confirmation.
+Use `save_draft` while writing, then review it with `get_drafts`; a draft can later provide the title, content, and target to `submit_documentation`, which still requires a separate confirmation.
 
 ## Available tools
 
 ### Dashboard and learning plan
 
-- `get_dashboard_overview` and `get_status`
-- `list_competency_goals` and `get_competency_goal`
-- `list_delmal` and `get_delmal`
-- `list_half_year_tasks` and `get_half_year_task`
+- `get_dashboard_overview` (`status_only: true` for the compact status summary)
+- `get_competency_goals` (all goals, one goal with its delmål, one delmål, or every delmål)
+- `get_half_year_tasks` (all six areas or one by ordinal)
 
 ### Documentation
 
-- `list_documentation` and `get_documentation`
-- `list_feedback` and `get_feedback`
-- `list_attachments` and `download_attachment` (read-only; metadata and explicit local downloads)
+- `get_documentation` (list with paging/search/status filter, or one record by `document_id`)
+- `get_feedback` (all feedback on a record, or one entry by ordinal)
+- `list_attachments` and `download_attachment` (metadata and explicit local downloads; Fagbrev.io is not changed)
 - `find_reusable_content`
 - `make_documentation_template`
-- `save_draft`, `list_drafts`, `get_draft`, `update_draft`, `delete_draft` (local-only)
+- `save_draft` (create or update), `get_drafts` (list or read one), `delete_draft` (local-only)
 - `get_context_bundle` (bounded dashboard, plan, and documentation context; five summaries by default)
 - `submit_documentation`
 - `update_documentation` (including optional target replacement)
 - `delete_documentation` (draft-only; currently reports unsupported when no clear UI action exists)
 - `request_approval`
+
+Targets are passed as flat fields: `goal_number`, optional `goal_title`, and optional `delmal_number` + `delmal_title`. Every tool carries MCP annotations (read-only, destructive, idempotent, open-world hints), and the server sends `instructions` describing the preview-then-confirm workflow.
 
 The competency goals and delmål are read-only learning-plan data. Documentation is the user-owned data that can be created or changed.
 

@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 /// The documentation states currently relevant to the dashboard workflow.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum DocumentationStatus {
     Draft,
     Submitted,
