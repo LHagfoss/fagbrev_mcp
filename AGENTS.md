@@ -37,14 +37,15 @@ The server has no hidden conversation memory. It keeps the saved browser authent
 
 ### Read tools
 
-- Dashboard: `get_dashboard_overview`, `get_status`
-- Learning plan: `list_competency_goals`, `get_competency_goal`, `list_delmal`, `get_delmal`
-- Documentation: `list_documentation`, `get_documentation`
-- Attachments: `list_attachments`, `download_attachment`
+- Dashboard: `get_dashboard_overview` (`status_only` returns the compact status summary)
+- Learning plan: `get_competency_goals` (no args = all 21 goals; `goal_number` = goal with delmål; `goal_number` + `delmal_number` = one delmål; `all_delmal` = every delmål), `get_half_year_tasks` (optional `ordinal`)
+- Documentation: `get_documentation` (list mode without `document_id`), `get_feedback` (optional `feedback_ordinal`)
+- Attachments: `list_attachments`, `download_attachment` (flat `source` kind + `document_id`/`feedback_ordinal`/`goal_number`/`delmal_number`)
 - Local composition: `find_reusable_content`, `make_documentation_template`
-- Local drafts: `save_draft`, `list_drafts`, `get_draft`, `update_draft`, `delete_draft`
+- Local drafts: `save_draft` (create or update), `get_drafts` (list or one), `delete_draft`
 - Bounded assembly: `get_context_bundle`
-- Half-year tasks and feedback are read-only tools exposed by the current main branch.
+
+Tool inputs are deliberately flat to keep `tools/list` small: targets use `goal_number`, `goal_title`, `delmal_number`, `delmal_title` (`TargetArgs` in `src/mcp.rs`), which are converted to the internal `DocumentationTarget`. Without a delmål the whole goal is targeted; with a delmål the goal is also selected only when `goal_title` is given. Avoid nested structs in request types; they produce per-tool `$defs`. Every tool declares MCP annotations, and `get_info` sets the server name `fagbrev`, the crate version, and `instructions`.
 
 Read tools should return normalized models from `src/data.rs`, not raw browser HTML. Raw page text is for diagnostics and should eventually be limited to `inspect`.
 
@@ -58,9 +59,9 @@ requested file, enforce a 25 MiB limit, and move the result to an explicit
 absolute path. MCP never returns file bytes. Existing files are protected
 unless `overwrite: true` is passed.
 
-`list_competency_goals` validates that all 21 numbered goals were parsed. The page has rendered its status count both before and after a numbered heading, so the parser accepts either adjacent order and reports a clear error instead of returning an empty success when the UI is still loading or changes.
+`get_competency_goals` (list mode) validates that all 21 numbered goals were parsed. The page has rendered its status count both before and after a numbered heading, so the parser accepts either adjacent order and reports a clear error instead of returning an empty success when the UI is still loading or changes.
 
-Documentation table reads use the smallest page-size option exposed by Fagbrev (`6`, `12`, `18`, `24`, `100`, or `200`) that can satisfy a requested bounded context limit. `get_context_bundle` trims that page to its requested maximum; an explicit `list_documentation` page size remains available for callers that intentionally need a larger page.
+Documentation table reads use the smallest page-size option exposed by Fagbrev (`6`, `12`, `18`, `24`, `100`, or `200`) that can satisfy a requested bounded context limit. `get_context_bundle` trims that page to its requested maximum; an explicit `get_documentation` list-mode page size remains available for callers that intentionally need a larger page.
 
 ### Write tools
 
@@ -70,7 +71,7 @@ Every mutating workflow requires an explicit `confirm: true`. With confirmation 
 
 The Fagbrev new-documentation form has an important side effect: opening it can create a blank draft. Treat opening that form as a mutation and keep it behind the same confirmation boundary.
 
-Local draft operations are different: they only read or atomically replace JSON files below the OS application-data directory's `drafts/` folder. A `LocalDraft` contains a generated local `draft_id`, title/content, target, source documentation IDs, version, timestamps, and `status: local_only`. It never contains browser profile data, credentials, cookies, or Firebase tokens. `save_draft` creates a draft when `draft_id` is omitted and updates one when its exact `expected_version` is supplied. `update_draft` always requires that version. `list_drafts` returns bounded summaries without content; `delete_draft` removes only the validated local file.
+Local draft operations are different: they only read or atomically replace JSON files below the OS application-data directory's `drafts/` folder. A `LocalDraft` contains a generated local `draft_id`, title/content, target, source documentation IDs, version, timestamps, and `status: local_only`. It never contains browser profile data, credentials, cookies, or Firebase tokens. `save_draft` creates a draft when `draft_id` is omitted and updates one when its exact `expected_version` is supplied (required for updates). `get_drafts` without `draft_id` returns bounded summaries without content; `delete_draft` removes only the validated local file.
 
 The draft fields are deliberately compatible with `submit_documentation`, but no draft tool submits automatically. A caller must explicitly read/review the draft and pass its data to the separately confirmation-gated Fagbrev write tool.
 
@@ -80,7 +81,7 @@ There are three different kinds of context:
 
 1. Authentication context: the saved Chrome profile. It is local sensitive state and never belongs in tool arguments or Git.
 2. Conversation context: the MCP host/AI client remembers previous tool results.
-3. Domain context: tool arguments and results carry `DocumentationTarget`, document IDs, delmål ordinals, source IDs, warnings, and statuses.
+3. Domain context: tool arguments carry flat target fields and results carry `DocumentationTarget`, document IDs, delmål ordinals, source IDs, warnings, and statuses.
 
 `get_context_bundle` is an explicit snapshot, not memory. It always attempts current dashboard/status reads, optionally includes one selected competency goal and its delmål, and includes at most five documentation summaries by default (maximum twenty). Passing explicit `document_ids` allows selected details; `include_document_content` must also be true before selected document content is returned. The response includes `retrieved_at`, source URLs, applied limits, and warnings. It never injects the whole archive by default.
 

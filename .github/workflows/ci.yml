@@ -100,7 +100,7 @@ jobs:
           node -e '
             const fs = require("fs");
             const output = fs.readFileSync("inspector-tools.json", "utf8");
-            if (!output.includes("get_status") || !output.includes("tools")) {
+            if (!output.includes("get_dashboard_overview") || !output.includes("tools")) {
               console.error(output);
               process.exit(1);
             }
