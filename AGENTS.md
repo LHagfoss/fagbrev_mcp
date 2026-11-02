@@ -13,6 +13,10 @@ The binary has two layers:
 
 The browser adapter uses `chromiumoxide` and a persistent, dedicated Chrome profile. `login` is headful so the user can authenticate. Normal reads run headless against the same profile. `FAGBREV_CDP_URL` and `FAGBREV_BROWSER_EXECUTABLE` are local development overrides.
 
+The `mcp` and `http` servers keep one shared headless browser for the whole process instead of launching Chrome per tool call; each call opens its own page directly at the target route and closes it when done. Calls take turns on that browser because Chrome throttles background tabs so hard that parallel pages stalled for minutes. The browser is relaunched if it dies, closed after ten idle minutes, and shut down when the server exits. One-shot CLI commands still own and close their own browser.
+
+Browser scripts live in Rust strings. Inside raw strings (`r#"..."#`) write JavaScript regexes with single backslashes (`/\s+/`); a doubled `\\s` reaches JavaScript as a literal backslash and silently matches nothing. A unit test scans `src/browser.rs` for this.
+
 ## Data flow
 
 ```text
@@ -59,7 +63,11 @@ requested file, enforce a 25 MiB limit, and move the result to an explicit
 absolute path. MCP never returns file bytes. Existing files are protected
 unless `overwrite: true` is passed.
 
+Delmål come from each expanded goal's rendered `Delmål ( N )` list (`[group="subGoals"]` items with a per-delmål count), not from the goal description. Descriptions often contain a bulleted "Forslag til oppgaver" list that differs from the real delmål and must not be used as targets. Counts render after the structure, so expansion waits for them. `all_delmal` expands every goal on one page. Goal details return the goal's own `description`, not the whole page text.
+
 `get_competency_goals` (list mode) validates that all 21 numbered goals were parsed. The page has rendered its status count both before and after a numbered heading, so the parser accepts either adjacent order and reports a clear error instead of returning an empty success when the UI is still loading or changes.
+
+The documentation table persists its last search, page size, and page in localStorage. List reads therefore always navigate with explicit `?size=&p=&q=` URL parameters (empty `q` clears a previous search); otherwise an earlier query silently filters later reads to `[]`.
 
 Documentation table reads use the smallest page-size option exposed by Fagbrev (`6`, `12`, `18`, `24`, `100`, or `200`) that can satisfy a requested bounded context limit. `get_context_bundle` trims that page to its requested maximum; an explicit `get_documentation` list-mode page size remains available for callers that intentionally need a larger page.
 
@@ -69,7 +77,7 @@ Documentation table reads use the smallest page-size option exposed by Fagbrev (
 
 Every mutating workflow requires an explicit `confirm: true`. With confirmation omitted or false, the MCP tool must validate the request and return a preview without opening an edit, detail, or new-entry page. Updates and deletes require the exact `updated_at` value returned by a prior read; deletes additionally require `expected_status: draft`. Never use direct Firebase writes or undocumented backend calls.
 
-The Fagbrev new-documentation form has an important side effect: opening it can create a blank draft. Treat opening that form as a mutation and keep it behind the same confirmation boundary.
+The Fagbrev new-documentation form has an important side effect: opening it creates a blank "Ingen tittel" draft and routes to `/l/dokumentasjon/{id}/rediger`. Treat opening that form as a mutation and keep it behind the same confirmation boundary. `submit_documentation` waits for that editor and for all 21 goal labels in the target picker before filling it, and if any later step fails its error names the created draft ID so the caller finishes it with `update_documentation` instead of submitting again.
 
 Local draft operations are different: they only read or atomically replace JSON files below the OS application-data directory's `drafts/` folder. A `LocalDraft` contains a generated local `draft_id`, title/content, target, source documentation IDs, version, timestamps, and `status: local_only`. It never contains browser profile data, credentials, cookies, or Firebase tokens. `save_draft` creates a draft when `draft_id` is omitted and updates one when its exact `expected_version` is supplied (required for updates). `get_drafts` without `draft_id` returns bounded summaries without content; `delete_draft` removes only the validated local file.
 

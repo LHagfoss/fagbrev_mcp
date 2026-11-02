@@ -26,11 +26,13 @@ pub async fn serve(options: HttpOptions) -> Result<()> {
     let app = Router::new().route_service("/mcp", service);
 
     eprintln!("Fagbrev MCP Streamable HTTP listening on http://{actual_addr}/mcp (Ctrl-C to stop)");
-    axum_serve(listener, app)
+    crate::browser::enable_shared_browser();
+    let result = axum_serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .context("Fagbrev MCP HTTP server stopped unexpectedly")?;
-    Ok(())
+        .context("Fagbrev MCP HTTP server stopped unexpectedly");
+    crate::browser::shutdown_shared_browser().await;
+    result
 }
 
 async fn shutdown_signal() {

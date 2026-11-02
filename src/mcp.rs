@@ -398,6 +398,24 @@ pub struct SubmitDocumentationRequest {
 pub struct RequestApprovalRequest {
     /// Documentation ID to send for approval.
     pub document_id: String,
+    /// Expected saved title; required for confirmed submission.
+    #[serde(default)]
+    pub expected_title: Option<String>,
+    /// Expected saved plain-text content; required for confirmed submission.
+    #[serde(default)]
+    pub expected_content: Option<String>,
+    /// Expected competency goal number; required for confirmed submission.
+    #[serde(default)]
+    pub goal_number: Option<u8>,
+    /// Expected goal title, if the whole goal is selected with a delmål.
+    #[serde(default)]
+    pub goal_title: Option<String>,
+    /// Expected delmål ordinal, if applicable.
+    #[serde(default)]
+    pub delmal_number: Option<u16>,
+    /// Expected delmål title, if applicable.
+    #[serde(default)]
+    pub delmal_title: Option<String>,
     /// true = actually send; default previews.
     #[serde(default)]
     pub confirm: bool,
@@ -456,8 +474,8 @@ pub struct ContextBundleRequest {
 
 const INSTRUCTIONS: &str = "Fagbrev: reads and manages the user's own Fagbrev.io apprenticeship dashboard (competency goals 1-21 with delmål, half-year tasks, documentation, feedback, attachments) through a logged-in local browser profile, plus local-only drafts.\n\
 Write model: submit_documentation, update_documentation, delete_documentation and request_approval are preview-only unless confirm=true. Always call once without confirm, show the preview to the user, and only repeat with confirm=true after explicit user approval. Updates/deletes need the exact updated_at from get_documentation.\n\
-Typical workflow: get_dashboard_overview -> get_competency_goals (pick goal/delmål numbers+titles) -> get_documentation / find_reusable_content -> make_documentation_template -> save_draft / get_drafts -> submit_documentation (preview, then confirm) -> request_approval.\n\
-Targets are flat fields: goal_number, goal_title, delmal_number, delmal_title. Ordinals are UI-local, never backend IDs.";
+Typical workflow: get_dashboard_overview -> get_competency_goals -> compose -> submit_documentation (preview, then confirm) -> request_approval (preview, then confirm with expected_title, expected_content and goal_number). Inspect the existing document ID before retrying any uncertain write.\n\
+Writes with delmål are disabled until their selection can be independently verified. Targets use flat fields; ordinals are UI-local, never backend IDs.";
 
 const NEW_FORM_WARNING: &str = "Opening the new documentation form may create a blank draft. No form is opened and no browser data is changed until confirm=true.";
 
@@ -969,7 +987,10 @@ impl FagbrevServer {
                 mutated: true,
                 preview,
                 record: Some(record),
-                message: Some("The visible Lagre action was activated.".to_string()),
+                message: Some(
+                    "Updated document values were verified on a freshly opened detail page."
+                        .to_string(),
+                ),
             }),
             Err(error) => json_error(format!(
                 "Could not update documentation through the visible UI: {error:#}"
@@ -1060,7 +1081,10 @@ impl FagbrevServer {
                 mutated: true,
                 preview,
                 record: Some(record),
-                message: Some("The visible Lagre action was activated.".to_string()),
+                message: Some(
+                    "Saved document values were verified on a freshly opened detail page."
+                        .to_string(),
+                ),
             }),
             Err(error) => json_error(format!(
                 "Could not save documentation through the visible UI: {error:#}"
@@ -1070,7 +1094,7 @@ impl FagbrevServer {
 
     #[tool(
         name = "request_approval",
-        description = "Send a documentation record for approval. Preview unless confirm=true.",
+        description = "Send for approval. Preview unless confirm=true; confirmed calls require expected_title, expected_content and goal_number. Delmål writes are unavailable.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1090,8 +1114,50 @@ impl FagbrevServer {
             return json_success(&approval_preview(request.document_id));
         }
 
+        let Some(title) = request
+            .expected_title
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return json_error(format!(
+                "Document {}: expected_title is required; nothing was submitted",
+                request.document_id
+            ));
+        };
+        let Some(content) = request
+            .expected_content
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return json_error(format!(
+                "Document {}: expected_content is required; nothing was submitted",
+                request.document_id
+            ));
+        };
+        let target = match build_target(
+            request.goal_number,
+            request.goal_title.clone(),
+            request.delmal_number,
+            request.delmal_title.clone(),
+        ) {
+            Ok(Some(target)) => target,
+            Ok(None) => {
+                return json_error(format!(
+                    "Document {}: expected goal_number is required; nothing was submitted",
+                    request.document_id
+                ));
+            }
+            Err(error) => return json_error(error),
+        };
         json_result(
-            browser::request_approval(&request.document_id, request.confirm).await,
+            browser::request_approval(
+                &request.document_id,
+                title,
+                content,
+                &target,
+                request.confirm,
+            )
+            .await,
             "Could not request approval through the visible UI",
         )
     }
@@ -1114,9 +1180,15 @@ impl rmcp::ServerHandler for FagbrevServer {
 }
 
 pub async fn serve() -> Result<()> {
+    browser::enable_shared_browser();
     let server = FagbrevServer::default();
-    let service = server.serve(stdio()).await?;
-    service.waiting().await?;
+    let result = async {
+        server.serve(stdio()).await?.waiting().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    browser::shutdown_shared_browser().await;
+    result?;
     Ok(())
 }
 

@@ -2,14 +2,21 @@ use std::{
     env, fs,
     io::{self, Write},
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use chromiumoxide::{
     Browser,
     browser::BrowserConfig,
-    cdp::browser_protocol::browser::{SetDownloadBehaviorBehavior, SetDownloadBehaviorParams},
+    cdp::browser_protocol::{
+        browser::{SetDownloadBehaviorBehavior, SetDownloadBehaviorParams},
+        input::InsertTextParams,
+    },
 };
 use directories::ProjectDirs;
 use futures_util::StreamExt;
@@ -30,6 +37,8 @@ const FAGBREV_URL: &str = "https://fagbrev.io/l";
 const PLAN_URL: &str = "https://fagbrev.io/l/laereplanmal";
 const DOCUMENTATION_URL: &str = "https://fagbrev.io/l/dokumentasjon";
 const LOGIN_WAIT: Duration = Duration::from_secs(10 * 60);
+const SHARED_BROWSER_IDLE: Duration = Duration::from_secs(10 * 60);
+const SHARED_PAGE_WAIT: Duration = Duration::from_secs(5 * 60);
 const DOCUMENTATION_PAGE_SIZES: [u32; 6] = [6, 12, 18, 24, 100, 200];
 const HALF_YEAR_TASK_TITLES: [&str; 6] = [
     "Etikk, lovverk og yrkesutøvelse",
@@ -75,8 +84,6 @@ struct DocumentationTableReadiness {
 struct DocumentationDetailSnapshot {
     title: Option<String>,
     status_label: Option<String>,
-    status_icon: Option<String>,
-    status_color: Option<String>,
     updated_at: Option<String>,
     content_text: Option<String>,
     content_html: Option<String>,
@@ -140,7 +147,12 @@ fn browser_config(headful: bool) -> Result<BrowserConfig> {
     let mut builder = BrowserConfig::builder()
         .user_data_dir(profile)
         .port(0)
-        .window_size(1280, 900);
+        .window_size(1280, 900)
+        .args([
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ]);
 
     if let Ok(executable) = env::var("FAGBREV_BROWSER_EXECUTABLE") {
         builder = builder.chrome_executable(executable);
@@ -259,6 +271,9 @@ fn documentation_status_from_ui(
     let icon = icon.unwrap_or_default().trim().to_lowercase();
     let color = color.unwrap_or_default().trim().to_lowercase();
 
+    if label == "sendt" {
+        return DocumentationStatus::Submitted;
+    }
     if label == "godkjent" || icon == "check-circle" || color == "bg-positive" {
         return DocumentationStatus::Approved;
     }
@@ -363,7 +378,6 @@ fn parse_target_summary(text: Option<&str>) -> Option<DocumentationTargetSummary
         ..DocumentationTargetSummary::default()
     };
     let mut current_goal = None;
-    let mut next_delmal = 0u16;
     let mut saw_target_data = false;
 
     for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
@@ -393,7 +407,6 @@ fn parse_target_summary(text: Option<&str>) -> Option<DocumentationTargetSummary
                 id: None,
             });
             current_goal = Some(number);
-            next_delmal = 0;
             saw_target_data = true;
             continue;
         }
@@ -401,10 +414,9 @@ fn parse_target_summary(text: Option<&str>) -> Option<DocumentationTargetSummary
             continue;
         }
         if let Some(goal_number) = current_goal {
-            next_delmal += 1;
             summary.delmal.push(Delmal {
                 goal_number,
-                number: Some(next_delmal),
+                number: None,
                 title: line.to_string(),
                 id: None,
                 status: None,
@@ -433,11 +445,9 @@ fn documentation_record_from_detail(
         content_html: snapshot
             .content_html
             .filter(|value| !value.trim().is_empty()),
-        status: documentation_status_from_ui(
-            snapshot.status_label.as_deref(),
-            snapshot.status_icon.as_deref(),
-            snapshot.status_color.as_deref(),
-        ),
+        // Detail-page icons can belong to feedback or other unrelated controls.
+        // Only an explicit status label is safe evidence for the document itself.
+        status: documentation_status_from_ui(snapshot.status_label.as_deref(), None, None),
         updated_at: snapshot.updated_at,
         attachments: snapshot.attachments,
         target_summary: parse_target_summary(snapshot.target_text.as_deref()),
@@ -446,26 +456,168 @@ fn documentation_record_from_detail(
     }
 }
 
-async fn open_dashboard(
-    headful: bool,
-) -> Result<(
-    Browser,
-    tokio::task::JoinHandle<()>,
+/// The browser behind one tool call. One-shot CLI commands own their browser;
+/// the MCP servers share one headless browser and only close their own page.
+enum BrowserHandle {
+    Owned(Box<Browser>),
+    Shared {
+        browser: Arc<Browser>,
+        page: chromiumoxide::Page,
+        _turn: tokio::sync::MutexGuard<'static, ()>,
+    },
+}
+
+impl std::ops::Deref for BrowserHandle {
+    type Target = Browser;
+
+    fn deref(&self) -> &Browser {
+        match self {
+            Self::Owned(browser) => browser,
+            Self::Shared { browser, .. } => browser,
+        }
+    }
+}
+
+type Session = (
+    BrowserHandle,
+    Option<tokio::task::JoinHandle<()>>,
     chromiumoxide::Page,
     bool,
-)> {
-    let owns_browser = env::var_os("FAGBREV_CDP_URL").is_none();
-    let (mut browser, mut handler) = launch(headful).await?;
-    let handler_task = tokio::spawn(async move {
+);
+
+struct SharedBrowser {
+    browser: Arc<Browser>,
+    handler_task: tokio::task::JoinHandle<()>,
+    last_used: Instant,
+}
+
+static SHARED_BROWSER_ENABLED: AtomicBool = AtomicBool::new(false);
+static SHARED_BROWSER: tokio::sync::Mutex<Option<SharedBrowser>> =
+    tokio::sync::Mutex::const_new(None);
+/// One shared-browser page at a time: Chrome throttles background tabs so
+/// hard that parallel tool calls took minutes instead of seconds.
+static SHARED_PAGE_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+// Serialize complete write workflows, including their separate read-back calls.
+// This cannot prevent concurrent changes made outside this server process.
+static DOCUMENTATION_WRITE_TURN: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Reuse one headless browser for every tool call in this process.
+///
+/// Launching Chrome per call dominated tool latency, and parallel calls each
+/// tried to lock the same profile. The browser is closed after
+/// `SHARED_BROWSER_IDLE` without calls and relaunched on demand.
+pub fn enable_shared_browser() {
+    if SHARED_BROWSER_ENABLED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async {
+        loop {
+            sleep(Duration::from_secs(60)).await;
+            let mut guard = SHARED_BROWSER.lock().await;
+            let idle = guard.as_ref().is_some_and(|shared| {
+                shared.last_used.elapsed() >= SHARED_BROWSER_IDLE
+                    && Arc::strong_count(&shared.browser) == 1
+            });
+            if idle && let Some(shared) = guard.take() {
+                close_shared_browser(shared).await;
+            }
+        }
+    });
+}
+
+pub async fn shutdown_shared_browser() {
+    if let Some(shared) = SHARED_BROWSER.lock().await.take() {
+        close_shared_browser(shared).await;
+    }
+}
+
+async fn close_shared_browser(shared: SharedBrowser) {
+    if let Ok(mut browser) = Arc::try_unwrap(shared.browser) {
+        let _ = browser.close().await;
+        let _ = browser.wait().await;
+    }
+    shared.handler_task.abort();
+}
+
+fn spawn_handler(mut handler: chromiumoxide::Handler) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
         while let Some(event) = handler.next().await {
             if let Err(error) = event {
                 tracing::debug!(%error, "browser handler stopped");
                 break;
             }
         }
+    })
+}
+
+async fn shared_browser() -> Result<Arc<Browser>> {
+    let mut guard = SHARED_BROWSER.lock().await;
+    if let Some(shared) = guard.as_mut()
+        && !shared.handler_task.is_finished()
+        && shared.browser.version().await.is_ok()
+    {
+        shared.last_used = Instant::now();
+        return Ok(shared.browser.clone());
+    }
+    if let Some(stale) = guard.take() {
+        close_shared_browser(stale).await;
+    }
+    let (browser, handler) = launch(false).await?;
+    let browser = Arc::new(browser);
+    *guard = Some(SharedBrowser {
+        browser: browser.clone(),
+        handler_task: spawn_handler(handler),
+        last_used: Instant::now(),
     });
+    Ok(browser)
+}
+
+async fn open_dashboard(headful: bool) -> Result<Session> {
+    open_session(headful, FAGBREV_URL).await
+}
+
+/// Open a page directly at `url`. With an attached CDP browser the current
+/// page is reused and navigated instead.
+async fn open_page(url: &str) -> Result<Session> {
+    let session = open_session(false, url).await?;
+    if env::var_os("FAGBREV_CDP_URL").is_some() {
+        session.2.goto(url).await?;
+    }
+    Ok(session)
+}
+
+async fn open_session(headful: bool, url: &str) -> Result<Session> {
+    let owns_browser = env::var_os("FAGBREV_CDP_URL").is_none();
+    if owns_browser && !headful && SHARED_BROWSER_ENABLED.load(Ordering::SeqCst) {
+        let turn = timeout(SHARED_PAGE_WAIT, SHARED_PAGE_TURN.lock())
+            .await
+            .context("timed out waiting for another Fagbrev browser call to finish")?;
+        let browser = shared_browser().await?;
+        // An interrupted call may have released the turn without closing its
+        // page. No other shared call can use these tabs while we hold the turn.
+        for stale_page in browser.pages().await? {
+            stale_page
+                .close()
+                .await
+                .context("could not close a stale Fagbrev browser page")?;
+        }
+        let page = browser.new_page(url).await?;
+        return Ok((
+            BrowserHandle::Shared {
+                browser,
+                page: page.clone(),
+                _turn: turn,
+            },
+            None,
+            page,
+            false,
+        ));
+    }
+
+    let (mut browser, handler) = launch(headful).await?;
+    let handler_task = Some(spawn_handler(handler));
     let page = if owns_browser {
-        browser.new_page(FAGBREV_URL).await?
+        browser.new_page(url).await?
     } else {
         browser.fetch_targets().await?;
         sleep(Duration::from_millis(250)).await;
@@ -476,23 +628,20 @@ async fn open_dashboard(
             bail!("connected browser has no open pages")
         }
     };
-    Ok((browser, handler_task, page, owns_browser))
+    Ok((
+        BrowserHandle::Owned(Box::new(browser)),
+        handler_task,
+        page,
+        owns_browser,
+    ))
 }
 
-async fn plan_page(
-    headful: bool,
-) -> Result<(
-    Browser,
-    tokio::task::JoinHandle<()>,
-    chromiumoxide::Page,
-    bool,
-)> {
-    let session = open_dashboard(headful).await?;
+async fn plan_page(headful: bool) -> Result<Session> {
+    let session = open_session(headful, PLAN_URL).await?;
     if env::var_os("FAGBREV_CDP_URL").is_none() {
-        wait_for_text(&session.2, "Opplæringsplan").await?;
-        session.2.goto(PLAN_URL).await?;
         let snapshot = wait_for_text(&session.2, "KOMPETANSEMÅL").await?;
         if !snapshot.text.contains("KOMPETANSEMÅL") {
+            finish(session.0, session.1, session.3).await?;
             bail!("the competency-goal tab did not finish loading");
         }
     } else if !session
@@ -507,14 +656,7 @@ async fn plan_page(
     Ok(session)
 }
 
-async fn half_year_page(
-    headful: bool,
-) -> Result<(
-    Browser,
-    tokio::task::JoinHandle<()>,
-    chromiumoxide::Page,
-    bool,
-)> {
+async fn half_year_page(headful: bool) -> Result<Session> {
     let session = plan_page(headful).await?;
     wait_for_text(&session.2, "HALVÅRSOPPGAVER").await?;
     let selected = session
@@ -731,6 +873,8 @@ fn parse_expanded_goal_from_page_text(
     let mut delmal = Vec::new();
     let mut current_title: Option<String> = None;
     let mut pending_status_count = None;
+    let mut in_delmal_list = false;
+    let mut pending_delmal_count = None;
 
     for raw_line in text.lines().filter(|line| !line.trim().is_empty()) {
         let line = raw_line.trim();
@@ -764,6 +908,30 @@ fn parse_expanded_goal_from_page_text(
             break;
         }
 
+        // The rendered "Delmål ( N )" list is authoritative. Bullets above it
+        // belong to the goal description ("Forslag til oppgaver"), so drop them.
+        if is_delmal_list_heading(line) {
+            in_delmal_list = true;
+            delmal.clear();
+            current_title = None;
+            continue;
+        }
+        if in_delmal_list {
+            if let Ok(count) = line.parse::<u32>() {
+                pending_delmal_count = Some(count);
+            } else {
+                delmal.push(Delmal {
+                    goal_number,
+                    number: Some(delmal.len() as u16 + 1),
+                    title: line.to_string(),
+                    id: None,
+                    status: None,
+                    status_count: pending_delmal_count.take(),
+                });
+            }
+            continue;
+        }
+
         if current_title.is_none() && line.parse::<u32>().is_ok() {
             status_count = line.parse::<u32>().ok();
             continue;
@@ -793,6 +961,14 @@ fn parse_expanded_goal_from_page_text(
     push_expanded_delmal(goal_number, &mut delmal, &mut current_title);
 
     (title, status_count, delmal)
+}
+
+fn is_delmal_list_heading(line: &str) -> bool {
+    line.strip_prefix("Delmål")
+        .map(str::trim)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.strip_suffix(')'))
+        .is_some_and(|count| count.trim().parse::<u32>().is_ok())
 }
 
 async fn competency_goal_attachment_snapshot(
@@ -835,57 +1011,108 @@ async fn competency_goal_attachment_snapshot(
     .map_err(Into::into)
 }
 
-async fn documentation_picker_page(
-    headful: bool,
-) -> Result<(
-    Browser,
-    tokio::task::JoinHandle<()>,
-    chromiumoxide::Page,
-    bool,
-)> {
-    let session = open_dashboard(headful).await?;
+/// Open the new-documentation form and wait until its target picker is usable.
+///
+/// Clicking "Skriv ny dokumentasjon" creates a blank draft and routes to its
+/// editor. The returned draft ID lets callers report that draft instead of
+/// silently leaving an untitled entry behind when a later step fails.
+async fn documentation_picker_page() -> Result<(Session, Option<String>)> {
+    let session = open_page(DOCUMENTATION_URL).await?;
     let page = &session.2;
-    page.goto(DOCUMENTATION_URL).await?;
-    wait_for_text(page, "Skriv ny dokumentasjon").await?;
-
-    let opened: bool = page
-        .evaluate(
+    let opened = async {
+        wait_for_text(page, "Skriv ny dokumentasjon").await?;
+        page.evaluate(
             "() => { const button = Array.from(document.querySelectorAll('button')).find(button => (button.textContent || '').includes('Skriv ny dokumentasjon')); if (!button) return false; button.click(); return true; }",
         )
         .await?
-        .into_value()?;
-    if !opened {
-        finish(session.0, session.1, session.3).await?;
-        bail!("could not open the new documentation form");
+        .into_value::<bool>()
+        .map_err(anyhow::Error::from)
+    }
+    .await;
+    match opened {
+        Ok(true) => {}
+        Ok(false) => {
+            finish(session.0, session.1, session.3).await?;
+            bail!("could not open the new documentation form");
+        }
+        Err(error) => {
+            let _ = finish(session.0, session.1, session.3).await;
+            return Err(with_blank_draft_hint(error, None));
+        }
     }
 
-    wait_for_text(page, "Kompetansemål og vurdering").await?;
-    let opened_competency_section: bool = page
-        .evaluate(
-            "() => { const button = Array.from(document.querySelectorAll('button')).find(button => (button.textContent || '').includes('Kompetansemål og vurdering')); if (!button) return false; button.click(); return true; }",
-        )
-        .await?
-        .into_value()?;
-    if !opened_competency_section {
-        finish(session.0, session.1, session.3).await?;
-        bail!("could not open the competency-goal target picker");
+    let mut draft_id = None;
+    for _ in 0..40 {
+        let url = match page.url().await {
+            Ok(url) => url.unwrap_or_default(),
+            Err(error) => {
+                let _ = finish(session.0, session.1, session.3).await;
+                return Err(with_blank_draft_hint(error.into(), None));
+            }
+        };
+        if url.trim_end_matches('/').ends_with("/rediger") {
+            draft_id = documentation_id_from_url(&url);
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
     }
 
-    wait_for_text(page, "valgbare").await?;
-    for _ in 0..8 {
+    let ready = async {
+        wait_for_edit_form(page).await?;
+        wait_for_target_picker(page).await
+    }
+    .await;
+    if let Err(error) = ready {
+        finish(session.0, session.1, session.3).await?;
+        return Err(with_blank_draft_hint(error, draft_id.as_deref()));
+    }
+    Ok((session, draft_id))
+}
+
+fn with_blank_draft_hint(error: anyhow::Error, draft_id: Option<&str>) -> anyhow::Error {
+    match draft_id {
+        Some(id) => error.context(format!(
+            "document {id} ({DOCUMENTATION_URL}/{id}) was created or may have been saved, but the operation is unconfirmed; inspect this ID and use update_documentation if needed, rather than creating another document"
+        )),
+        None => error.context(
+            "opening the form may have created a blank \"Ingen tittel\" draft; check get_documentation before submitting again",
+        ),
+    }
+}
+
+/// Wait until every numbered competency goal is rendered as a picker label,
+/// then reveal the delmål hidden behind "Vis N til" buttons.
+async fn wait_for_target_picker(page: &chromiumoxide::Page) -> Result<()> {
+    let mut goal_labels = 0;
+    for _ in 0..40 {
+        goal_labels = page
+            .evaluate(
+                "() => Array.from(document.querySelectorAll('main label')).filter(label => label.querySelector('.FCheckbox') && /^\\d+\\.\\s/.test((label.innerText || '').trim())).length",
+            )
+            .await?
+            .into_value::<u32>()?;
+        if goal_labels >= 21 {
+            break;
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    if goal_labels < 21 {
+        bail!("the documentation target picker showed {goal_labels} of 21 competency goals");
+    }
+
+    for _ in 0..12 {
         let expanded: bool = page
             .evaluate(
-                "() => { const buttons = Array.from(document.querySelectorAll('button')).filter(button => /^Vis \\d+ til$/.test((button.textContent || '').trim())); buttons.forEach(button => button.click()); return buttons.length > 0; }",
+                "() => { const buttons = Array.from(document.querySelectorAll('main button')).filter(button => /^Vis \\d+ til$/.test((button.innerText || '').replace(/\\s+/g, ' ').trim())); buttons.forEach(button => button.click()); return buttons.length > 0; }",
             )
             .await?
             .into_value()?;
         if !expanded {
-            break;
+            return Ok(());
         }
-        sleep(Duration::from_millis(100)).await;
+        sleep(Duration::from_millis(150)).await;
     }
-
-    Ok(session)
+    bail!("the documentation target picker kept showing \"Vis N til\" buttons")
 }
 
 async fn click_documentation_expansion(page: &chromiumoxide::Page, prefix: &str) -> Result<bool> {
@@ -974,9 +1201,14 @@ async fn documentation_detail_snapshot(
     page.evaluate(
         r#"() => {
             const main = document.querySelector('main');
-            const knownStatuses = ['Kladd', 'Godkjent', 'Må rettes', 'Trenger endring', 'Til vurdering', 'Avvist'];
-            const statusParagraph = Array.from(main?.querySelectorAll('p') || [])
-                .find(element => knownStatuses.includes(element.innerText.trim()));
+            const knownStatuses = ['Kladd', 'Godkjent', 'Må rettes', 'Trenger endring', 'Til vurdering', 'Sendt', 'Avvist'];
+            // The top status card is distinct from documentation text and feedback.
+            // If its structure changes, return unknown instead of guessing.
+            const statusCards = Array.from(main?.querySelectorAll('.vcard.bg-dark') || [])
+                .filter(card => !card.closest('.ql-editor') && card.querySelector('i[data-name], i[data-type]'));
+            const statusParagraphs = statusCards.flatMap(card => Array.from(card.querySelectorAll('p.text-lg.font-medium')))
+                .filter(element => knownStatuses.includes(element.innerText.trim()));
+            const statusParagraph = statusParagraphs.length === 1 ? statusParagraphs[0] : null;
             const statusIcon = Array.from(main?.querySelectorAll('i[data-name], i[data-type]') || [])
                 .find(element => ['check-circle', 'edit', 'edit-2', 'clock'].includes(element.getAttribute('data-name') || element.getAttribute('data-type')));
             const colorContainer = statusIcon?.closest('[class*="bg-"]');
@@ -1057,6 +1289,20 @@ async fn wait_for_feedback_section(page: &chromiumoxide::Page) -> Result<()> {
     Ok(())
 }
 
+fn documentation_list_url(page_number: u32, page_size: u32, query: Option<&str>) -> String {
+    let query = query.map(str::trim).unwrap_or_default();
+    let mut encoded = String::new();
+    for byte in query.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    format!("{DOCUMENTATION_URL}?size={page_size}&p={page_number}&q={encoded}")
+}
+
 pub async fn list_documentation(
     page_number: u32,
     page_size: u32,
@@ -1070,21 +1316,12 @@ pub async fn list_documentation(
         bail!("page_size must be one of 6, 12, 18, 24, 100, or 200");
     }
 
-    let (browser, handler_task, page, owns_browser) = open_dashboard(false).await?;
-    page.goto(DOCUMENTATION_URL).await?;
+    // The table keeps its last search/page size/page in localStorage. Always
+    // pass all three in the URL so a previous query cannot leak into this read.
+    let url = documentation_list_url(page_number, page_size, query.as_deref());
+    let (browser, handler_task, page, owns_browser) = open_page(&url).await?;
     wait_for_text(&page, "En oversikt over alle dine dokumentasjoner").await?;
     wait_for_documentation_rows(&page).await?;
-
-    if let Some(query) = query.filter(|value| !value.trim().is_empty()) {
-        let value = serde_json::to_string(&query)?;
-        page.evaluate(format!(
-            "() => {{ const input = document.querySelector('input[aria-label=\\\"Søk\\\"]'); if (!input) return false; const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set; setter.call(input, {value}); input.dispatchEvent(new Event('input', {{bubbles: true}})); input.dispatchEvent(new Event('change', {{bubbles: true}})); return true; }}"
-        ))
-        .await?
-        .into_value::<bool>()?;
-        sleep(Duration::from_millis(500)).await;
-        wait_for_documentation_rows(&page).await?;
-    }
 
     if let Some(status) = status {
         let label = match status {
@@ -1120,44 +1357,6 @@ pub async fn list_documentation(
         wait_for_documentation_rows(&page).await?;
     }
 
-    if page_size != 6 {
-        page.evaluate(
-            "() => { const input = document.querySelector('input[role=\"combobox\"]'); if (!input) return false; input.click(); return true; }",
-        )
-        .await?
-        .into_value::<bool>()?;
-        sleep(Duration::from_millis(100)).await;
-        let page_size_label = serde_json::to_string(&page_size.to_string())?;
-        let selected = page
-            .evaluate(format!(
-                "() => {{ const item = Array.from(document.querySelectorAll('[role=\"option\"]')).find(element => (element.textContent || '').trim() === {page_size_label}); if (!item) return false; item.click(); return true; }}"
-            ))
-            .await?
-            .into_value::<bool>()?;
-        if !selected {
-            finish(browser, handler_task, owns_browser).await?;
-            bail!("page size option is not exposed by the current UI");
-        }
-        sleep(Duration::from_millis(500)).await;
-        wait_for_documentation_rows(&page).await?;
-    }
-
-    if page_number > 1 {
-        let page_label = serde_json::to_string(&page_number.to_string())?;
-        let selected = page
-            .evaluate(format!(
-                "() => {{ const item = Array.from(document.querySelectorAll('nav button')).find(element => (element.textContent || '').trim() === {page_label}); if (!item) return false; item.click(); return true; }}"
-            ))
-            .await?
-            .into_value::<bool>()?;
-        if !selected {
-            finish(browser, handler_task, owns_browser).await?;
-            bail!("documentation page {page_number} is not available");
-        }
-        sleep(Duration::from_millis(500)).await;
-        wait_for_documentation_rows(&page).await?;
-    }
-
     let snapshot = documentation_list_snapshot(&page).await?;
     let actual_page_size = snapshot.page_size.unwrap_or(page_size);
     let items = parse_documentation_rows(snapshot.rows);
@@ -1174,16 +1373,22 @@ pub async fn list_documentation(
 pub async fn get_documentation(document_id: &str) -> Result<DocumentationRecord> {
     validate_documentation_id(document_id)?;
 
-    let (browser, handler_task, page, owns_browser) = open_dashboard(false).await?;
     let url = format!("{DOCUMENTATION_URL}/{document_id}");
-    page.goto(&url).await?;
+    let (browser, handler_task, page, owns_browser) = open_page(&url).await?;
     wait_for_text(&page, "Sist endret:").await?;
     wait_for_feedback_section(&page).await?;
     let _ = click_documentation_expansion(&page, "Vedlegg (").await?;
     let _ = click_documentation_expansion(&page, "Se kompetansemål").await?;
     sleep(Duration::from_millis(250)).await;
+    let actual_url = page.url().await?.unwrap_or_default();
+    if actual_url.trim_end_matches('/') != url {
+        finish(browser, handler_task, owns_browser).await?;
+        bail!(
+            "requested document {document_id}, but the visible page has a different URL: {actual_url}"
+        );
+    }
     let snapshot = documentation_detail_snapshot(&page).await?;
-    let result = documentation_record_from_detail(document_id.to_string(), url, snapshot);
+    let result = documentation_record_from_detail(document_id.to_string(), actual_url, snapshot);
     finish(browser, handler_task, owns_browser).await?;
     Ok(result)
 }
@@ -1244,21 +1449,81 @@ pub fn validate_documentation_target(target: &DocumentationTarget) -> Result<()>
     Ok(())
 }
 
-fn plain_text_as_safe_html(content: &str) -> String {
-    content
-        .split("\n\n")
-        .map(|paragraph| {
-            let escaped = paragraph
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-                .replace('\'', "&#39;")
-                .replace('\n', "<br>");
-            format!("<p>{escaped}</p>")
-        })
-        .collect::<Vec<_>>()
-        .join("")
+/// Compare the saved UI text conservatively while tolerating HTML whitespace.
+fn comparable_document_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn verify_saved_documentation(
+    record: &DocumentationRecord,
+    document_id: &str,
+    title: &str,
+    content: &str,
+    target: &DocumentationTarget,
+) -> Result<()> {
+    if record.id.as_deref() != Some(document_id)
+        || record
+            .url
+            .as_deref()
+            .and_then(documentation_id_from_url)
+            .as_deref()
+            != Some(document_id)
+    {
+        bail!("saved document identity could not be verified");
+    }
+    if record
+        .title
+        .as_deref()
+        .map(comparable_document_text)
+        .as_deref()
+        != Some(comparable_document_text(title).as_str())
+    {
+        bail!("saved title differs from the expected title");
+    }
+    let expected_content = comparable_document_text(content);
+    if expected_content.is_empty()
+        || record
+            .content
+            .as_deref()
+            .map(comparable_document_text)
+            .as_deref()
+            != Some(expected_content.as_str())
+    {
+        bail!("saved content is empty, unavailable, or differs from the expected content");
+    }
+    let summary = record
+        .target_summary
+        .as_ref()
+        .context("saved target selection could not be read")?;
+    if target.delmal.is_some() {
+        // The detail page shows selected titles, not their ordinal in the full
+        // plan. Do not claim that an ordinal has been verified by guessing.
+        bail!(
+            "saved delmål ordinal cannot be verified from the detail page; inspect this document manually"
+        );
+    }
+    if let Some(goal) = &target.competency_goal {
+        if summary.competency_goals.len() != 1
+            || !summary.delmal.is_empty()
+            || summary.competency_goals[0].number != goal.number
+        {
+            bail!("saved target selection differs from the expected competency goal");
+        }
+        if let Some(expected_title) = &goal.title
+            && summary.competency_goals[0]
+                .title
+                .as_deref()
+                .map(comparable_document_text)
+                .as_deref()
+                != Some(comparable_document_text(expected_title).as_str())
+        {
+            bail!("saved competency goal title differs from the expected title");
+        }
+    }
+    if target.competency_goal.is_none() && target.delmal.is_none() {
+        bail!("an expected target is required to verify the saved document");
+    }
+    Ok(())
 }
 
 fn documentation_id_from_url(url: &str) -> Option<String> {
@@ -1292,7 +1557,7 @@ async fn fill_documentation_form(
     replace_targets: bool,
 ) -> Result<()> {
     let title = serde_json::to_string(title)?;
-    let content_html = serde_json::to_string(&plain_text_as_safe_html(content))?;
+    let expected_title = title.clone();
     let mut targets = Vec::new();
     if let Some(target) = replacement_target {
         if let Some(goal) = &target.competency_goal {
@@ -1319,14 +1584,8 @@ async fn fill_documentation_form(
             r#"() => {{
                 const targets = {targets};
                 const replaceTargets = {replace_targets};
-                const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
-                if (replaceTargets) {{
-                    for (let attempt = 0; attempt < 12; attempt++) {{
-                        const more = Array.from(document.querySelectorAll('main button')).filter(button => /^Vis \\d+ til$/.test(normalize(button.innerText)));
-                        if (!more.length) break;
-                        more.forEach(button => button.click());
-                    }}
-                }}
+                const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+                const comparable = value => normalize(value).toLocaleLowerCase('nb').replace(/[.:]+$/, '');
                 const labels = Array.from(document.querySelectorAll('main label'));
                 const found = targets.map(target => ({{ target, label: null }}));
                 let currentGoal = null;
@@ -1335,12 +1594,13 @@ async fn fill_documentation_form(
                 for (const label of labels) {{
                     const text = normalize(label.innerText);
                     const checkbox = label.querySelector('.FCheckbox');
-                    const goalMatch = text.match(/^(\\d+)\\.\\s+/);
+                    const goalMatch = text.match(/^(\d+)\.\s+/);
                     if (checkbox && goalMatch) {{
                         currentGoal = Number(goalMatch[1]);
                         delmalOrdinal = 0;
+                        const goalText = comparable(label.querySelector('.FCheckbox span')?.innerText || text);
                         for (const item of found.filter(item => item.target.kind === 'competency_goal')) {{
-                            const titleMatches = !item.target.title || text.startsWith(`${{item.target.number}}. ${{item.target.title}}`);
+                            const titleMatches = !item.target.title || goalText.startsWith(comparable(`${{item.target.number}}. ${{item.target.title}}`));
                             if (currentGoal === item.target.number && titleMatches) item.label = label;
                         }}
                         continue;
@@ -1348,28 +1608,30 @@ async fn fill_documentation_form(
                     if (!checkbox || currentGoal === null) continue;
                     delmalOrdinal += 1;
                     for (const item of found.filter(item => item.target.kind === 'delmal')) {{
-                        const titleMatches = !item.target.title || text === normalize(item.target.title);
+                        const titleMatches = !item.target.title || comparable(text) === comparable(item.target.title);
                         if (currentGoal === item.target.goal_number && delmalOrdinal === item.target.number && titleMatches) item.label = label;
                     }}
                 }}
 
                 const missing = found.filter(item => !item.label).map(item => item.target.kind);
-                if (missing.length) return {{ok: false, missing, message: 'one or more target references were not found in the visible picker'}};
+                if (missing.length) {{
+                    const goals = labels.filter(label => label.querySelector('.FCheckbox') && /^\d+\.\s/.test(normalize(label.innerText))).length;
+                    return {{ok: false, missing, message: `one or more target references were not found in the visible picker (${{goals}} goal labels, ${{labels.length}} labels)`}};
+                }}
 
                 const input = document.querySelector('input[placeholder="Dokumentasjonavn"]');
                 const editor = document.querySelector('main .ql-editor');
                 if (!input || !editor) return {{ok: false, missing: [], message: 'the documentation title or editor field was not exposed by the UI'}};
-                const inputSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-                inputSetter.call(input, {title});
-                input.dispatchEvent(new Event('input', {{bubbles: true}}));
-                input.dispatchEvent(new Event('change', {{bubbles: true}}));
-                editor.innerHTML = {content_html};
-                editor.dispatchEvent(new InputEvent('input', {{bubbles: true, inputType: 'insertText'}}));
-                editor.dispatchEvent(new Event('change', {{bubbles: true}}));
-                if (replaceTargets) {{
-                    document.querySelectorAll('main label .FCheckboxMarkerBody.FMarked').forEach(marker => marker.closest('label')?.click());
+
+                const selected = new Set(found.map(item => item.label.querySelector('.FCheckbox[role="checkbox"]')));
+                if (selected.has(null)) return {{ok: false, missing: [], message: 'a target checkbox was not available'}};
+                const controls = Array.from(document.querySelectorAll('main label .FCheckbox[role="checkbox"]'));
+                for (const control of controls) {{
+                    const checked = control.getAttribute('aria-checked');
+                    if (checked !== 'true' && checked !== 'false') return {{ok: false, missing: [], message: 'target checkbox state is unknown'}};
+                    const shouldSelect = selected.has(control);
+                    if ((shouldSelect && checked === 'false') || (replaceTargets && !shouldSelect && checked === 'true')) control.click();
                 }}
-                found.forEach(item => item.label.click());
                 return {{ok: true, missing: [], message: null}};
             }}"#
         ))
@@ -1384,6 +1646,47 @@ async fn fill_documentation_form(
             detail.push_str(&format!(" (missing: {})", result.missing.join(", ")));
         }
         bail!(detail);
+    }
+    let title_ready: bool = page.evaluate("() => { const input = document.querySelector('input[placeholder=\"Dokumentasjonavn\"]'); if (!input) return false; input.focus(); input.select(); return true; }").await?.into_value()?;
+    if !title_ready {
+        bail!("title field unavailable; save was not attempted");
+    }
+    page.execute(InsertTextParams::new(serde_json::from_str::<String>(
+        &expected_title,
+    )?))
+    .await?;
+    let editor_ready: bool = page.evaluate("() => { const editor = document.querySelector('main .ql-editor'); if (!editor) return false; editor.focus(); const range = document.createRange(); range.selectNodeContents(editor); const selection = window.getSelection(); selection.removeAllRanges(); selection.addRange(range); return true; }").await?.into_value()?;
+    if !editor_ready {
+        bail!("editor unavailable; save was not attempted");
+    }
+    page.execute(InsertTextParams::new(content.to_string()))
+        .await?;
+    let expected_content = serde_json::to_string(&comparable_document_text(content))?;
+    let filled: bool = page.evaluate(format!(r#"() => {{ const normalize = s => (s || '').replace(/\s+/g, ' ').trim(); return document.querySelector('input[placeholder="Dokumentasjonavn"]')?.value === {expected_title} && normalize(document.querySelector('main .ql-editor')?.innerText) === {expected_content}; }}"#)).await?.into_value()?;
+    if !filled {
+        bail!("filled title or content did not match; save was not attempted");
+    }
+    if let Some(target) = replacement_target {
+        let expected = target.competency_goal.as_ref().map(|goal| goal.number);
+        let script = format!(
+            r#"() => {{
+            const expected = {};
+            const selected = Array.from(document.querySelectorAll('main label .FCheckbox[role="checkbox"][aria-checked="true"]'));
+            return selected.length === 1 && selected[0].closest('label')?.innerText.trim().startsWith(`${{expected}}. `);
+        }}"#,
+            serde_json::to_string(&expected)?
+        );
+        let mut verified = false;
+        for _ in 0..12 {
+            if page.evaluate(script.clone()).await?.into_value::<bool>()? {
+                verified = true;
+                break;
+            }
+            sleep(Duration::from_millis(250)).await;
+        }
+        if !verified {
+            bail!("target checkbox selection was not confirmed; save was not attempted");
+        }
     }
     Ok(())
 }
@@ -1402,6 +1705,9 @@ pub async fn submit_documentation(
         bail!("submit_documentation requires confirm=true before opening the form");
     }
     validate_documentation_target(target)?;
+    if target.delmal.is_some() {
+        bail!("delmål selection cannot yet be verified safely; no document was created");
+    }
     if title.trim().is_empty() {
         bail!("title cannot be empty");
     }
@@ -1409,36 +1715,62 @@ pub async fn submit_documentation(
         bail!("content cannot be empty");
     }
 
-    let (browser, handler_task, page, owns_browser) = documentation_picker_page(false).await?;
+    let _write_turn = DOCUMENTATION_WRITE_TURN.lock().await;
+    let ((browser, handler_task, page, owns_browser), draft_id) =
+        documentation_picker_page().await?;
     let result = async {
+        let id = draft_id
+            .as_deref()
+            .context("draft ID was not visible; do not create another document")?;
         fill_new_documentation_form(&page, title, content, target).await?;
-        let clicked: bool = page
-            .evaluate(
-                "() => { const button = Array.from(document.querySelectorAll('main button')).find(button => button.type === 'submit' && (button.textContent || '').trim() === 'Lagre'); if (!button) return false; button.click(); return true; }",
-            )
-            .await?
-            .into_value()?;
-        if !clicked {
-            bail!("the documentation save control was not exposed by the UI");
+        click_save(&page).await?;
+        let url = wait_for_saved_url(&page).await?;
+        if url.trim_end_matches('/') != format!("{DOCUMENTATION_URL}/{id}") {
+            bail!("save navigated to an unexpected document URL");
         }
-
-        sleep(Duration::from_millis(750)).await;
-        let url = page.url().await?.unwrap_or_default();
-        let id = documentation_id_from_url(&url);
-        Ok(DocumentationRecord {
-            id,
-            url: (!url.is_empty()).then_some(url),
-            title: Some(title.to_string()),
-            content: Some(content.to_string()),
-            content_html: Some(plain_text_as_safe_html(content)),
-            status: DocumentationStatus::Draft,
-            target: target.clone(),
-            ..DocumentationRecord::default()
-        })
+        Ok::<(), anyhow::Error>(())
     }
     .await;
-    finish(browser, handler_task, owns_browser).await?;
-    result
+    let close_result = finish(browser, handler_task, owns_browser).await;
+    let id = draft_id.as_deref();
+    result.map_err(|error| with_blank_draft_hint(error, id))?;
+    close_result.map_err(|error| with_blank_draft_hint(error, id))?;
+    let id = id.context("draft ID is unknown; check the documentation list before trying again")?;
+    let record = get_documentation(id)
+        .await
+        .map_err(|error| with_blank_draft_hint(error, Some(id)))?;
+    verify_saved_documentation(&record, id, title, content, target)
+        .map_err(|error| with_blank_draft_hint(error, Some(id)))?;
+    Ok(record)
+}
+
+async fn click_save(page: &chromiumoxide::Page) -> Result<()> {
+    let clicked: bool = page
+        .evaluate(
+            "() => { const button = Array.from(document.querySelectorAll('main button')).find(button => button.type === 'submit' && (button.textContent || '').trim() === 'Lagre'); if (!button) return false; button.click(); return true; }",
+        )
+        .await?
+        .into_value()?;
+    if !clicked {
+        bail!("the documentation save control was not exposed by the UI");
+    }
+    Ok(())
+}
+
+/// Saving must route from `/{id}/rediger` back to the record.
+async fn wait_for_saved_url(page: &chromiumoxide::Page) -> Result<String> {
+    let mut url = String::new();
+    for _ in 0..20 {
+        sleep(Duration::from_millis(250)).await;
+        url = page.url().await?.unwrap_or_default();
+        if !url.trim_end_matches('/').ends_with("/rediger") {
+            break;
+        }
+    }
+    if url.is_empty() || url.trim_end_matches('/').ends_with("/rediger") {
+        bail!("save was not confirmed: the editor did not navigate to the document");
+    }
+    Ok(url)
 }
 
 async fn wait_for_edit_form(page: &chromiumoxide::Page) -> Result<()> {
@@ -1485,9 +1817,26 @@ pub async fn update_documentation(
     }
     if let Some(target) = replacement_target {
         validate_documentation_target(target)?;
+        if target.delmal.is_some() {
+            bail!(
+                "document {document_id}: delmål selection cannot yet be verified safely; nothing was changed"
+            );
+        }
     }
 
+    let _write_turn = DOCUMENTATION_WRITE_TURN.lock().await;
     let current = get_documentation(document_id).await?;
+    if replacement_target.is_none() {
+        let summary = current
+            .target_summary
+            .as_ref()
+            .context("existing target cannot be verified; nothing was changed")?;
+        if summary.competency_goals.len() != 1 || !summary.delmal.is_empty() {
+            bail!(
+                "document {document_id}: existing target cannot be verified safely; nothing was changed"
+            );
+        }
+    }
     let current_updated_at = current
         .updated_at
         .as_deref()
@@ -1500,11 +1849,13 @@ pub async fn update_documentation(
         );
     }
 
-    let (browser, handler_task, page, owns_browser) = open_dashboard(false).await?;
     let url = format!("{DOCUMENTATION_URL}/{document_id}/rediger");
-    page.goto(&url).await?;
+    let (browser, handler_task, page, owns_browser) = open_page(&url).await?;
     let result = async {
         wait_for_edit_form(&page).await?;
+        if replacement_target.is_some() {
+            wait_for_target_picker(&page).await?;
+        }
         fill_documentation_form(
             &page,
             title,
@@ -1513,35 +1864,41 @@ pub async fn update_documentation(
             replacement_target.is_some(),
         )
         .await?;
-        let clicked: bool = page
-            .evaluate(
-                "() => { const button = Array.from(document.querySelectorAll('main button')).find(button => button.type === 'submit' && (button.textContent || '').trim() === 'Lagre'); if (!button) return false; button.click(); return true; }",
-            )
-            .await?
-            .into_value()?;
-        if !clicked {
-            bail!("the documentation save control was not exposed by the UI");
-        }
-        sleep(Duration::from_millis(750)).await;
+        click_save(&page).await?;
+        wait_for_saved_url(&page).await?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    finish(browser, handler_task, owns_browser).await?;
-    result?;
+    let close_result = finish(browser, handler_task, owns_browser).await;
+    result.with_context(|| {
+        format!("document {document_id} may have been modified; inspect this ID before retrying")
+    })?;
+    close_result.with_context(|| {
+        format!("document {document_id} may have been modified; inspect this ID before retrying")
+    })?;
 
-    match get_documentation(document_id).await {
-        Ok(record) => Ok(record),
-        Err(_) => Ok(DocumentationRecord {
-            id: Some(document_id.to_string()),
-            url: Some(format!("{DOCUMENTATION_URL}/{document_id}")),
-            title: Some(title.to_string()),
-            content: Some(content.to_string()),
-            content_html: Some(plain_text_as_safe_html(content)),
-            target: replacement_target.cloned().unwrap_or_default(),
-            updated_at: Some(expected_updated_at.to_string()),
-            ..DocumentationRecord::default()
-        }),
+    let record = get_documentation(document_id).await.with_context(|| format!(
+        "update of document {document_id} may have been applied, but could not be verified; inspect this ID before retrying"
+    ))?;
+    let expected_target = if let Some(target) = replacement_target {
+        target.clone()
+    } else {
+        let summary = current.target_summary.as_ref().with_context(|| format!(
+            "document {document_id}: previous target could not be read; update cannot be verified"
+        ))?;
+        DocumentationTarget {
+            competency_goal: summary.competency_goals.first().cloned(),
+            delmal: summary.delmal.first().cloned(),
+        }
+    };
+    verify_saved_documentation(&record, document_id, title, content, &expected_target)
+        .with_context(|| format!("update of document {document_id} may have been applied, but verification failed; inspect this ID before retrying"))?;
+    if replacement_target.is_none() && current.target_summary != record.target_summary {
+        bail!(
+            "update of document {document_id} may have changed target selection; inspect this ID before retrying"
+        );
     }
+    Ok(record)
 }
 
 /// Attempt to delete a draft only when the visible detail page exposes a
@@ -1564,6 +1921,7 @@ pub async fn delete_documentation(
         bail!("delete_documentation requires confirm=true before opening a documentation page");
     }
 
+    let _write_turn = DOCUMENTATION_WRITE_TURN.lock().await;
     let current = get_documentation(document_id).await?;
     if current.status != DocumentationStatus::Draft {
         bail!("refusing to delete a documentation record that is not a draft");
@@ -1580,9 +1938,8 @@ pub async fn delete_documentation(
         );
     }
 
-    let (browser, handler_task, page, owns_browser) = open_dashboard(false).await?;
     let url = format!("{DOCUMENTATION_URL}/{document_id}");
-    page.goto(&url).await?;
+    let (browser, handler_task, page, owns_browser) = open_page(&url).await?;
     wait_for_text(&page, "Sist endret:").await?;
     let result = async {
         let delete_visible: bool = page
@@ -1648,23 +2005,56 @@ fn delete_unsupported_result(
 
 /// Request approval using the visible `Send inn` action on a documentation
 /// detail page. If that action is absent, no click is attempted.
-pub async fn request_approval(document_id: &str, confirm: bool) -> Result<RequestApprovalResult> {
+pub async fn request_approval(
+    document_id: &str,
+    title: &str,
+    content: &str,
+    target: &DocumentationTarget,
+    confirm: bool,
+) -> Result<RequestApprovalResult> {
     if !confirm {
         bail!("request_approval requires confirm=true before opening a documentation page");
     }
     validate_documentation_id(document_id)?;
+    validate_documentation_target(target)?;
+    if target.delmal.is_some() {
+        bail!(
+            "document {document_id}: delmål selection cannot yet be verified safely; nothing was submitted"
+        );
+    }
+    if title.trim().is_empty() || content.trim().is_empty() {
+        bail!(
+            "document {document_id}: expected title and content must not be empty; nothing was submitted"
+        );
+    }
 
-    let (browser, handler_task, page, owns_browser) = open_dashboard(false).await?;
+    let _write_turn = DOCUMENTATION_WRITE_TURN.lock().await;
     let url = format!("{DOCUMENTATION_URL}/{document_id}");
-    page.goto(&url).await?;
-    wait_for_text(&page, "Sist endret:").await?;
+    let (browser, handler_task, page, owns_browser) = open_page(&url).await?;
     let result = async {
+        let snapshot = wait_for_text(&page, "Sist endret:").await?;
+        if snapshot.url.trim_end_matches('/') != url || !snapshot.text.contains("Sist endret:") {
+            bail!("document {document_id}: detail page identity or loading could not be verified; nothing was submitted");
+        }
+        if !click_documentation_expansion(&page, "Se kompetansemål").await? {
+            bail!("document {document_id}: target panel was not available; nothing was submitted");
+        }
+        sleep(Duration::from_millis(250)).await;
+        let detail = documentation_detail_snapshot(&page).await?;
+        let record = documentation_record_from_detail(document_id.to_string(), snapshot.url, detail);
+        verify_saved_documentation(&record, document_id, title, content, target)
+            .with_context(|| format!("document {document_id}: saved data could not be verified; nothing was submitted"))?;
+        if !matches!(record.status, DocumentationStatus::Draft | DocumentationStatus::NeedsCorrection) {
+            bail!("document {document_id}: current status is not a confirmed editable draft; nothing was submitted");
+        }
         let clicked: bool = page
             .evaluate(
                 "() => { const button = Array.from(document.querySelectorAll('main button')).find(button => (button.textContent || '').trim() === 'Send inn'); if (!button) return false; button.click(); return true; }",
             )
-            .await?
-            .into_value()?;
+            .await
+            .with_context(|| format!("document {document_id}: submission may have been activated; inspect this ID before retrying"))?
+            .into_value()
+            .with_context(|| format!("document {document_id}: submission may have been activated; inspect this ID before retrying"))?;
         if !clicked {
             return Ok(RequestApprovalResult {
                 outcome: "unsupported".to_string(),
@@ -1678,27 +2068,53 @@ pub async fn request_approval(document_id: &str, confirm: bool) -> Result<Reques
             });
         }
 
-        sleep(Duration::from_millis(750)).await;
-        let snapshot = page_snapshot(&page).await?;
-        let status = if snapshot.text.contains("Til vurdering") {
-            Some(DocumentationStatus::InReview)
-        } else {
-            None
-        };
+        // Keep the page alive while the site's asynchronous submission starts.
+        sleep(Duration::from_secs(2)).await;
         Ok(RequestApprovalResult {
-            outcome: "requested".to_string(),
+            outcome: "unconfirmed".to_string(),
             confirmation_required: false,
             would_mutate: true,
             mutated: true,
             document_id: document_id.to_string(),
-            url: Some(snapshot.url),
-            status,
-            message: "The visible 'Send inn' action was activated.".to_string(),
+            url: Some(url.clone()),
+            status: None,
+            message: "The visible 'Send inn' action was activated; submission has not yet been confirmed. Inspect this document ID before retrying.".to_string(),
         })
     }
     .await;
-    finish(browser, handler_task, owns_browser).await?;
-    result
+    let close_result = finish(browser, handler_task, owns_browser).await;
+    let mut result = result
+        .with_context(|| format!("document {document_id}: inspect this ID before retrying"))?;
+    if let Err(error) = close_result {
+        if result.mutated {
+            result.message = format!(
+                "Submission may have been activated for document {document_id}, but the browser could not be closed: {error:#}. Inspect this ID before retrying."
+            );
+            return Ok(result);
+        }
+        return Err(error);
+    }
+    if !result.mutated {
+        return Ok(result);
+    }
+    // Open a fresh page after releasing the shared-browser lock. A click alone
+    // is never evidence that the server accepted the submission.
+    for _ in 0..4 {
+        sleep(Duration::from_millis(750)).await;
+        if let Ok(record) = get_documentation(document_id).await
+            && matches!(
+                record.status,
+                DocumentationStatus::Submitted | DocumentationStatus::InReview
+            )
+            && verify_saved_documentation(&record, document_id, title, content, target).is_ok()
+        {
+            result.outcome = "requested".to_string();
+            result.status = Some(record.status);
+            result.message = "Submission status and saved document contents were confirmed on a fresh detail page.".to_string();
+            return Ok(result);
+        }
+    }
+    Ok(result)
 }
 
 pub async fn dashboard_overview() -> Result<DashboardOverview> {
@@ -1746,41 +2162,180 @@ pub async fn list_competency_goals() -> Result<Vec<CompetencyGoal>> {
     result
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct ExpandedGoalSnapshot {
+    number: u8,
+    status_count: Option<u32>,
+    ready: bool,
+    description: Option<String>,
+    delmal: Vec<DelmalSnapshot>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DelmalSnapshot {
+    title: String,
+    status_count: Option<u32>,
+}
+
+struct ExpandedGoal {
+    title: Option<String>,
+    status_count: Option<u32>,
+    description: Option<String>,
+    delmal: Vec<Delmal>,
+}
+
+/// Shared plan-page lookup: `goalRoots(numbers)` maps each requested goal
+/// number to its expansion trigger and panel root.
+const GOAL_ROOTS_JS: &str = r#"
+    const normalize = value => (value || '').replace(/\s+/g, ' ').trim();
+    const goalRoots = numbers => {
+        const roots = new Map();
+        for (const button of document.querySelectorAll('main button.FExpantion-trigger')) {
+            const heading = (button.innerText || '').split('\n').map(normalize).find(line => /^\d+\.\s/.test(line));
+            const number = heading ? Number(heading.match(/^(\d+)\./)[1]) : null;
+            if (numbers.includes(number) && !roots.has(number)) roots.set(number, { button, root: button.parentElement });
+        }
+        return roots;
+    };
+"#;
+
+/// Expand the requested goals on the plan page in one pass and read their
+/// delmål from the rendered "Delmål ( N )" list.
+///
+/// The list is read from the DOM because the goal description above it often
+/// contains a bulleted "Forslag til oppgaver" list that is not the delmål.
+async fn expand_goals(page: &chromiumoxide::Page, numbers: &[u8]) -> Result<Vec<ExpandedGoal>> {
+    let wanted = serde_json::to_string(numbers)?;
+    let found: Vec<u8> = page
+        .evaluate(format!(
+            r#"() => {{
+                {GOAL_ROOTS_JS}
+                const roots = goalRoots({wanted});
+                for (const {{ button, root }} of roots.values()) {{
+                    if (!root?.querySelector('.FExpantion-arrow-open')) button.click();
+                }}
+                return Array.from(roots.keys());
+            }}"#
+        ))
+        .await?
+        .into_value()?;
+    if let Some(missing) = numbers.iter().find(|number| !found.contains(number)) {
+        bail!("could not find competency goal {missing} on the plan page");
+    }
+
+    let snapshot_script = format!(
+        r#"() => {{
+            {GOAL_ROOTS_JS}
+            const roots = goalRoots({wanted});
+            return Array.from(roots.entries()).map(([number, {{ root }}]) => {{
+                const content = root?.querySelector('.FExpantion-content');
+                const delmal = Array.from(root?.querySelectorAll('[group="subGoals"]') || []).map(item => {{
+                    const count = normalize(item.querySelector('small')?.innerText);
+                    return {{ title: normalize(item.querySelector('p')?.innerText), status_count: /^\d+$/.test(count) ? Number(count) : null }};
+                }}).filter(item => item.title);
+                const countLine = (root?.querySelector('button.FExpantion-trigger')?.innerText || '').split('\n').map(normalize).find(line => /^\d+$/.test(line));
+                const status_count = countLine ? Number(countLine) : null;
+                // Structure renders before the per-goal/per-delmål counts arrive.
+                const countsLoaded = status_count !== null && delmal.every(item => item.status_count !== null);
+                return {{
+                    number,
+                    status_count,
+                    ready: !!content && countsLoaded && (delmal.length > 0 || (root.innerText || '').includes('Se tilknyttede dokumentasjoner')),
+                    description: content?.querySelector('.ql-editor')?.innerText?.trim() || null,
+                    delmal
+                }};
+            }});
+        }}"#
+    );
+    let mut snapshots: Vec<ExpandedGoalSnapshot> = Vec::new();
+    for _ in 0..30 {
+        snapshots = page
+            .evaluate(snapshot_script.as_str())
+            .await?
+            .into_value()?;
+        if snapshots.iter().all(|snapshot| snapshot.ready) {
+            break;
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+
+    let text = page_snapshot(page).await?.text;
+    Ok(numbers
+        .iter()
+        .map(|&number| {
+            let (title, status_count, text_delmal) =
+                parse_expanded_goal_from_page_text(&text, number);
+            let snapshot = snapshots.iter().find(|snapshot| snapshot.number == number);
+            let delmal = match snapshot {
+                Some(snapshot) if snapshot.ready || !snapshot.delmal.is_empty() => snapshot
+                    .delmal
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| Delmal {
+                        goal_number: number,
+                        number: Some(index as u16 + 1),
+                        title: item.title.clone(),
+                        id: None,
+                        status: None,
+                        status_count: item.status_count,
+                    })
+                    .collect(),
+                _ => text_delmal,
+            };
+            ExpandedGoal {
+                title,
+                status_count: snapshot
+                    .and_then(|snapshot| snapshot.status_count)
+                    .or(status_count),
+                description: snapshot.and_then(|snapshot| snapshot.description.clone()),
+                delmal,
+            }
+        })
+        .collect())
+}
+
 pub async fn competency_goal(number: u8) -> Result<CompetencyGoalDetails> {
     if !(1..=21).contains(&number) {
         bail!("goal number must be between 1 and 21");
     }
 
     let (browser, handler_task, page, owns_browser) = plan_page(false).await?;
-    let clicked: bool = page
-        .evaluate(format!(
-            "() => {{ const button = Array.from(document.querySelectorAll('button')).find(button => new RegExp('(?:^|\\\\s){}\\\\.\\\\s').test((button.textContent || '').replace(/\\\\s+/g, ' ').trim())); if (!button) return false; button.click(); return true; }}",
-            number
-        ))
-        .await?
-        .into_value()?;
-
-    if !clicked {
-        finish(browser, handler_task, owns_browser).await?;
-        bail!("could not find competency goal {number} on the plan page");
+    let result = async {
+        let goal = expand_goals(&page, &[number])
+            .await?
+            .pop()
+            .context("competency goal expansion returned no result")?;
+        let attachments = competency_goal_attachment_snapshot(&page, number, None).await?;
+        Ok(CompetencyGoalDetails {
+            number,
+            url: page.url().await?.unwrap_or_default(),
+            page_title: page.get_title().await?.unwrap_or_default(),
+            description: goal.description,
+            title: goal.title,
+            status_count: goal.status_count,
+            delmal: goal.delmal,
+            attachments,
+        })
     }
-
-    sleep(Duration::from_millis(500)).await;
-    let snapshot = page_snapshot(&page).await?;
-    let (title, status_count, delmal) = parse_expanded_goal_from_page_text(&snapshot.text, number);
-    let attachments = competency_goal_attachment_snapshot(&page, number, None).await?;
-    let result = CompetencyGoalDetails {
-        number,
-        url: snapshot.url,
-        page_title: snapshot.title,
-        visible_text: snapshot.text,
-        title,
-        status_count,
-        delmal,
-        attachments,
-    };
+    .await;
     finish(browser, handler_task, owns_browser).await?;
-    Ok(result)
+    result
+}
+
+async fn delmal_title(
+    page: &chromiumoxide::Page,
+    goal_number: u8,
+    delmal_number: u16,
+) -> Result<String> {
+    let goal = expand_goals(page, &[goal_number])
+        .await?
+        .pop()
+        .context("competency goal expansion returned no result")?;
+    goal.delmal
+        .into_iter()
+        .find(|item| item.number == Some(delmal_number))
+        .map(|item| item.title)
+        .with_context(|| format!("could not find delmål {delmal_number} for goal {goal_number}"))
 }
 
 async fn delmal_attachments(
@@ -1788,28 +2343,13 @@ async fn delmal_attachments(
     delmal_number: u16,
 ) -> Result<Vec<AttachmentMetadata>> {
     let (browser, handler_task, page, owns_browser) = plan_page(false).await?;
-    let clicked: bool = page
-        .evaluate(format!(
-            "() => {{ const button = Array.from(document.querySelectorAll('main button')).find(element => new RegExp('(?:^|\\\\s){}\\\\.\\\\s').test((element.innerText || '').replace(/\\\\s+/g, ' ').trim())); if (!button) return false; button.click(); return true; }}",
-            goal_number
-        ))
-        .await?
-        .into_value()?;
-    if !clicked {
-        finish(browser, handler_task, owns_browser).await?;
-        bail!("could not find competency goal {goal_number} on the plan page");
+    let result = async {
+        let title = delmal_title(&page, goal_number, delmal_number).await?;
+        competency_goal_attachment_snapshot(&page, goal_number, Some(&title)).await
     }
-    sleep(Duration::from_millis(500)).await;
-    let snapshot = page_snapshot(&page).await?;
-    let (_, _, delmal) = parse_expanded_goal_from_page_text(&snapshot.text, goal_number);
-    let target = delmal
-        .into_iter()
-        .find(|item| item.number == Some(delmal_number))
-        .with_context(|| format!("could not find delmål {delmal_number} for goal {goal_number}"))?;
-    let attachments =
-        competency_goal_attachment_snapshot(&page, goal_number, Some(&target.title)).await?;
+    .await;
     finish(browser, handler_task, owns_browser).await?;
-    Ok(attachments)
+    result
 }
 
 pub async fn list_delmal(goal_number: Option<u8>) -> Result<Vec<Delmal>> {
@@ -1821,13 +2361,14 @@ pub async fn list_delmal(goal_number: Option<u8>) -> Result<Vec<Delmal>> {
 
     // The documentation target picker is not read-only: opening a new-entry
     // form has been observed to create a blank draft. Read delmål from the
-    // existing training-plan UI instead.
+    // existing training-plan UI instead, expanding every goal on one page.
     let goal_numbers = goal_number.map_or_else(|| (1..=21).collect(), |number| vec![number]);
-    let mut result = Vec::new();
-    for number in goal_numbers {
-        result.extend(competency_goal(number).await?.delmal);
-    }
-    Ok(result)
+    let (browser, handler_task, page, owns_browser) = plan_page(false).await?;
+    let result = expand_goals(&page, &goal_numbers)
+        .await
+        .map(|goals| goals.into_iter().flat_map(|goal| goal.delmal).collect());
+    finish(browser, handler_task, owns_browser).await?;
+    result
 }
 
 pub async fn get_delmal(goal_number: u8, delmal_number: u16) -> Result<Delmal> {
@@ -1991,7 +2532,7 @@ fn attachment_click_script(
         AttachmentSource::CompetencyGoal { goal_number } => Ok(format!(
             r#"() => {{
             {extractor}
-            const button = Array.from(document.querySelectorAll('main button')).find(element => new RegExp('(?:^|\\s){}\\.\\s').test((element.innerText || '').replace(/\\s+/g, ' ').trim()));
+            const button = Array.from(document.querySelectorAll('main button')).find(element => new RegExp('(?:^|\\s){}\\.\\s').test((element.innerText || '').replace(/\s+/g, ' ').trim()));
             return attachment(button?.parentElement, {index});
         }}"#,
             goal_number
@@ -2002,13 +2543,13 @@ fn attachment_click_script(
             Ok(format!(
                 r#"() => {{
                 {extractor}
-                const button = Array.from(document.querySelectorAll('main button')).find(element => new RegExp('(?:^|\\s){}\\.\\s').test((element.innerText || '').replace(/\\s+/g, ' ').trim()));
+                const button = Array.from(document.querySelectorAll('main button')).find(element => new RegExp('(?:^|\\s){}\\.\\s').test((element.innerText || '').replace(/\s+/g, ' ').trim()));
                 const root = button?.parentElement;
                 const target = {title};
                 const items = Array.from(root?.querySelectorAll('.FFileViewerBtn') || []).filter(element => {{
                     let node = element.parentElement;
                     while (node && node !== root) {{
-                        if ((node.innerText || '').replace(/\\s+/g, ' ').trim().includes(target)) return true;
+                        if ((node.innerText || '').replace(/\s+/g, ' ').trim().includes(target)) return true;
                         node = node.parentElement;
                     }}
                     return false;
@@ -2125,58 +2666,37 @@ pub async fn download_attachment(
         .find(|attachment| attachment.ordinal == ordinal)
         .with_context(|| format!("could not find attachment {ordinal} for the selected source"))?;
     let metadata = attachment.clone();
-    let mut delmal_title = None;
+    let mut delmal_title_value = None;
     let (browser, handler_task, page, owns_browser) = match &source {
         AttachmentSource::Documentation { document_id }
         | AttachmentSource::Feedback { document_id, .. } => {
-            let session = open_dashboard(false).await?;
-            let url = format!("{DOCUMENTATION_URL}/{document_id}");
-            session.2.goto(&url).await?;
+            let session = open_page(&format!("{DOCUMENTATION_URL}/{document_id}")).await?;
             wait_for_text(&session.2, "Sist endret:").await?;
             wait_for_feedback_section(&session.2).await?;
             let _ = click_documentation_expansion(&session.2, "Vedlegg (").await?;
-            (session.0, session.1, session.2, session.3)
+            session
         }
         AttachmentSource::CompetencyGoal { goal_number } => {
             let session = plan_page(false).await?;
-            let clicked: bool = session.2.evaluate(format!("() => {{ const button = Array.from(document.querySelectorAll('main button')).find(element => new RegExp('(?:^|\\\\s){}\\\\.\\\\s').test((element.innerText || '').replace(/\\\\s+/g, ' ').trim())); if (!button) return false; button.click(); return true; }}", goal_number)).await?.into_value()?;
-            if !clicked {
+            if let Err(error) = expand_goals(&session.2, &[*goal_number]).await {
                 finish(session.0, session.1, session.3).await?;
-                bail!("could not find competency goal {goal_number} on the plan page");
+                return Err(error);
             }
-            sleep(Duration::from_millis(500)).await;
-            (session.0, session.1, session.2, session.3)
+            session
         }
         AttachmentSource::Delmal {
             goal_number,
             delmal_number,
         } => {
             let session = plan_page(false).await?;
-            let clicked: bool = session
-                .2
-                .evaluate(format!(
-                    "() => {{ const button = Array.from(document.querySelectorAll('main button')).find(element => new RegExp('(?:^|\\\\s){}\\\\.\\\\s').test((element.innerText || '').replace(/\\\\s+/g, ' ').trim())); if (!button) return false; button.click(); return true; }}",
-                    goal_number
-                ))
-                .await?
-                .into_value()?;
-            if !clicked {
-                finish(session.0, session.1, session.3).await?;
-                bail!("could not find competency goal {goal_number} on the plan page");
+            match delmal_title(&session.2, *goal_number, *delmal_number).await {
+                Ok(title) => delmal_title_value = Some(title),
+                Err(error) => {
+                    finish(session.0, session.1, session.3).await?;
+                    return Err(error);
+                }
             }
-            sleep(Duration::from_millis(500)).await;
-            let snapshot = page_snapshot(&session.2).await?;
-            let (_, _, delmal) = parse_expanded_goal_from_page_text(&snapshot.text, *goal_number);
-            delmal_title = Some(
-                delmal
-                    .into_iter()
-                    .find(|item| item.number == Some(*delmal_number))
-                    .with_context(|| {
-                        format!("could not find delmål {delmal_number} for goal {goal_number}")
-                    })?
-                    .title,
-            );
-            (session.0, session.1, session.2, session.3)
+            session
         }
     };
     let result = download_from_page(
@@ -2184,7 +2704,7 @@ pub async fn download_attachment(
         &page,
         &source,
         ordinal,
-        delmal_title.as_deref(),
+        delmal_title_value.as_deref(),
         &output_path,
         overwrite,
     )
@@ -2203,15 +2723,26 @@ pub async fn download_attachment(
 }
 
 async fn finish(
-    mut browser: Browser,
-    handler_task: tokio::task::JoinHandle<()>,
+    browser: BrowserHandle,
+    handler_task: Option<tokio::task::JoinHandle<()>>,
     close_browser: bool,
 ) -> Result<()> {
-    if close_browser {
-        browser.close().await?;
-        browser.wait().await?;
+    match browser {
+        BrowserHandle::Owned(mut browser) => {
+            if close_browser {
+                browser.close().await?;
+                browser.wait().await?;
+            }
+        }
+        BrowserHandle::Shared { page, .. } => {
+            if let Err(error) = page.close().await {
+                tracing::debug!(%error, "could not close a shared-browser page");
+            }
+        }
     }
-    handler_task.abort();
+    if let Some(handler_task) = handler_task {
+        handler_task.abort();
+    }
     Ok(())
 }
 
@@ -2288,12 +2819,11 @@ mod tests {
     use super::{
         DocumentationDetailSnapshot, DocumentationRowSnapshot, DocumentationTableReadiness,
         FeedbackSnapshot, HalfYearTaskSnapshot, PageSnapshot, dashboard_overview_from_snapshot,
-        delete_unsupported_result, documentation_page_size_for_limit,
+        delete_unsupported_result, documentation_list_url, documentation_page_size_for_limit,
         documentation_record_from_detail, documentation_status_from_ui,
         documentation_table_is_rendered, goal_list_error, goal_list_is_complete,
         parse_documentation_rows, parse_expanded_goal_from_page_text, parse_feedback,
-        parse_goals_from_page_text, parse_half_year_tasks, plain_text_as_safe_html,
-        validate_documentation_target,
+        parse_goals_from_page_text, parse_half_year_tasks, validate_documentation_target,
     };
     use crate::data::{CompetencyGoalReference, Delmal, DocumentationStatus, DocumentationTarget};
 
@@ -2381,6 +2911,59 @@ mod tests {
     }
 
     #[test]
+    fn prefers_the_rendered_delmal_list_over_suggested_task_bullets() {
+        let (title, status_count, delmal) = parse_expanded_goal_from_page_text(
+            "0\n12. Beskrive krav til infrastruktur\n\nForslag til oppgaver:\n * Lage og dokumentere nettverkskisse\n * Foreslå og begrunne mulige tilpasninger\n\nDelmål ( 3 )\n\n0\n\nForklare forskjeller på skytjenester og on-premise løsninger\n\n2\n\nLage og dokumentere nettverkskisse\n\n0\n\nDokumentere infrastrukturstandarder\n\nSe tilknyttede dokumentasjoner (0)\nNy dokumentasjon\n0\n13. Next goal",
+            12,
+        );
+
+        assert_eq!(title.as_deref(), Some("Beskrive krav til infrastruktur"));
+        assert_eq!(status_count, Some(0));
+        let titles = delmal
+            .iter()
+            .map(|item| item.title.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            titles,
+            [
+                "Forklare forskjeller på skytjenester og on-premise løsninger",
+                "Lage og dokumentere nettverkskisse",
+                "Dokumentere infrastrukturstandarder",
+            ]
+        );
+        assert_eq!(delmal[1].number, Some(2));
+        assert_eq!(delmal[1].status_count, Some(2));
+    }
+
+    #[test]
+    fn documentation_list_url_always_resets_search_state() {
+        assert_eq!(
+            documentation_list_url(1, 100, None),
+            "https://fagbrev.io/l/dokumentasjon?size=100&p=1&q="
+        );
+        assert_eq!(
+            documentation_list_url(2, 6, Some(" mål 12&x ")),
+            "https://fagbrev.io/l/dokumentasjon?size=6&p=2&q=m%C3%A5l%2012%26x"
+        );
+    }
+
+    #[test]
+    fn raw_string_scripts_do_not_double_escape_regex_literals() {
+        // Inside r#"..."# a `\\s` reaches JavaScript as a literal backslash,
+        // which silently broke target matching in the documentation picker.
+        let source = include_str!("browser.rs");
+        for script in source.split("r#\"").skip(1) {
+            let script = script.split("\"#").next().unwrap_or_default();
+            for pattern in ["/\\\\s", "/^(\\\\d", "(\\\\d+)\\\\."] {
+                assert!(
+                    !script.contains(pattern),
+                    "double-escaped regex {pattern} in raw script"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn parses_documentation_rows_with_real_ids_and_ui_statuses() {
         let rows = parse_documentation_rows(vec![
             DocumentationRowSnapshot {
@@ -2445,8 +3028,6 @@ mod tests {
             DocumentationDetailSnapshot {
                 title: Some("My documentation".to_string()),
                 status_label: Some("Godkjent".to_string()),
-                status_icon: Some("check-circle".to_string()),
-                status_color: Some("bg-positive".to_string()),
                 updated_at: Some("03.06.2026".to_string()),
                 content_text: Some("Visible documentation text".to_string()),
                 content_html: Some("<p>Visible documentation text</p>".to_string()),
@@ -2595,11 +3176,70 @@ mod tests {
     }
 
     #[test]
-    fn escapes_plain_text_before_rich_editor_insertion() {
-        let html = plain_text_as_safe_html("<script>alert('x')</script>\nnext");
+    fn verifies_saved_record_and_rejects_untrusted_results() {
+        use crate::data::{DocumentationRecord, DocumentationTargetSummary};
+        let goal = CompetencyGoalReference {
+            number: 12,
+            title: None,
+            id: None,
+        };
+        let target = DocumentationTarget {
+            competency_goal: Some(goal.clone()),
+            delmal: None,
+        };
+        let record = DocumentationRecord {
+            id: Some("doc123".into()),
+            url: Some("https://fagbrev.io/l/dokumentasjon/doc123".into()),
+            title: Some("Tittel".into()),
+            content: Some("Linje 1\nLinje 2".into()),
+            target_summary: Some(DocumentationTargetSummary {
+                competency_goals: vec![goal],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let verify = |record: &DocumentationRecord| {
+            super::verify_saved_documentation(
+                record,
+                "doc123",
+                "Tittel",
+                "Linje 1\nLinje 2",
+                &target,
+            )
+        };
+        assert!(verify(&record).is_ok());
+        let mut changed = record.clone();
+        changed.content = None;
+        assert!(verify(&changed).is_err());
+        changed.content = Some("annet".into());
+        assert!(verify(&changed).is_err());
+        changed = record.clone();
+        changed.title = Some("Ingen tittel".into());
+        assert!(verify(&changed).is_err());
+        changed = record.clone();
+        changed.id = Some("wrong".into());
+        assert!(verify(&changed).is_err());
+        changed = record.clone();
+        changed.url = Some("https://fagbrev.io/l/dokumentasjon/wrong".into());
+        assert!(verify(&changed).is_err());
+        changed = record.clone();
+        changed.target_summary = None;
+        assert!(verify(&changed).is_err());
+        changed = record.clone();
+        changed
+            .target_summary
+            .as_mut()
+            .unwrap()
+            .competency_goals
+            .push(CompetencyGoalReference {
+                number: 5,
+                title: None,
+                id: None,
+            });
+        assert!(verify(&changed).is_err());
         assert_eq!(
-            html,
-            "<p>&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;<br>next</p>"
+            documentation_status_from_ui(Some("Sendt"), None, None),
+            DocumentationStatus::Submitted
         );
     }
 
@@ -2611,9 +3251,10 @@ mod tests {
             .expect_err("unconfirmed submit must stop before browser access");
         assert!(submit_error.to_string().contains("confirm=true"));
 
-        let approval_error = super::request_approval("document-123", false)
-            .await
-            .expect_err("unconfirmed approval must stop before browser access");
+        let approval_error =
+            super::request_approval("document-123", "title", "content", &target, false)
+                .await
+                .expect_err("unconfirmed approval must stop before browser access");
         assert!(approval_error.to_string().contains("confirm=true"));
 
         let update_error = super::update_documentation(
