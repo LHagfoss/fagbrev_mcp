@@ -294,7 +294,9 @@ pub struct CompetencyGoalDetails {
     pub number: u8,
     pub url: String,
     pub page_title: String,
-    pub visible_text: String,
+    /// The goal's own guidance text from the plan, without the rest of the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
